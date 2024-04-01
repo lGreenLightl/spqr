@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/xdg-go/scram"
 	"golang.org/x/crypto/pbkdf2"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/pg-sharding/spqr/pkg/config"
+
+	"github.com/go-ldap/ldap/v3"
 )
 
 func AuthBackend(shard conn.DBInstance, berule *config.BackendRule, msg pgproto3.BackendMessage) error {
@@ -284,6 +287,109 @@ func AuthFrontend(cl client.Client, rule *config.FrontendRule) error {
 		}
 		err = cl.Send(&pgproto3.AuthenticationSASLFinal{Data: []byte(finalMsg)})
 		return err
+	case config.AuthLDAP:
+		// TODO: add cfg params validating
+		// TODO: prettify err
+		// TODO: add tls support
+
+		conn, err := ldap.DialURL(fmt.Sprintf(
+			"%s://%s:%d",
+			rule.AuthRule.LDAPConfig.Scheme,
+			rule.AuthRule.LDAPConfig.Server,
+			rule.AuthRule.LDAPConfig.Port,
+		))
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+
+		switch rule.AuthRule.LDAPConfig.Mode {
+		case config.SimpleBindMode:
+			pwd, err := cl.PasswordCT()
+			if err != nil {
+				return err
+			}
+
+			err = conn.Bind(fmt.Sprintf(
+				"%s%s%s",
+				rule.AuthRule.LDAPConfig.Prefix,
+				cl.Usr(),
+				rule.AuthRule.LDAPConfig.Suffix,
+			), pwd)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		case config.SearchAndBindMode:
+			if rule.AuthRule.LDAPConfig.BindDN == "" && rule.AuthRule.LDAPConfig.BindPassword == "" {
+				err = conn.UnauthenticatedBind(fmt.Sprintf(
+					"cn=admin%s",
+					rule.AuthRule.LDAPConfig.Suffix,
+				))
+			} else {
+				err = conn.Bind(
+					rule.AuthRule.LDAPConfig.BindDN,
+					rule.AuthRule.LDAPConfig.BindPassword,
+				)
+			}
+			if err != nil {
+				return err
+			}
+
+			var searchAttribute string
+			switch rule.AuthRule.LDAPConfig.SearchAttribute {
+			case "":
+				searchAttribute = "uid"
+			default:
+				searchAttribute = rule.AuthRule.LDAPConfig.SearchAttribute
+			}
+
+			var searchFilter string
+			switch rule.AuthRule.LDAPConfig.SearchFilter {
+			case "":
+				searchFilter = fmt.Sprintf("(%s=%s)", searchAttribute, ldap.EscapeFilter(cl.Usr()))
+			default:
+				searchFilter = strings.ReplaceAll(
+					rule.AuthRule.LDAPConfig.SearchFilter,
+					"$username",
+					ldap.EscapeFilter(cl.Usr()),
+				)
+			}
+
+			searchRequest := ldap.NewSearchRequest(
+				rule.AuthRule.LDAPConfig.BaseDN,
+				ldap.ScopeWholeSubtree,
+				ldap.NeverDerefAliases,
+				0,
+				0,
+				false,
+				searchFilter,
+				[]string{"dn"},
+				[]ldap.Control{},
+			)
+
+			searchResult, err := conn.Search(searchRequest)
+			if err != nil {
+				return err
+			}
+
+			userDN := searchResult.Entries[0].DN
+
+			pwd, err := cl.PasswordCT()
+			if err != nil {
+				return err
+			}
+
+			err = conn.Bind(userDN, pwd)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		default:
+			return fmt.Errorf("invalid ldap auth mode '%v'", rule.AuthRule.LDAPConfig.Mode)
+		}
 	default:
 		return fmt.Errorf("invalid auth method '%v'", rule.AuthRule.Method)
 	}
