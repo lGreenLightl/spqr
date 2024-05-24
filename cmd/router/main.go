@@ -10,6 +10,7 @@ import (
 	"path"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"sync"
 	"syscall"
 
@@ -20,8 +21,8 @@ import (
 	"github.com/pg-sharding/spqr/pkg/datatransfers"
 	"github.com/pg-sharding/spqr/pkg/spqrlog"
 	"github.com/pg-sharding/spqr/qdb"
-	router "github.com/pg-sharding/spqr/router"
 	"github.com/pg-sharding/spqr/router/app"
+	"github.com/pg-sharding/spqr/router/instance"
 	"github.com/pkg/errors"
 	"github.com/sevlyar/go-daemon"
 	"github.com/spf13/cobra"
@@ -42,6 +43,11 @@ var (
 	qdbImpl  string
 
 	persist bool
+
+	routerPort   int
+	routerROPort int
+	adminPort    int
+	grpcPort     int
 
 	rootCmd = &cobra.Command{
 		Use:   "spqr-router run --config `path-to-config-folder`",
@@ -69,6 +75,11 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&ccfgPath, "coordinator-config", "", "/etc/spqr/coordinator.yaml", "path to coordinator config file")
 	rootCmd.PersistentFlags().StringVarP(&qdbImpl, "qdb-impl", "", "etcd", "which implementation of QDB to use.")
 	rootCmd.PersistentFlags().BoolVarP(&persist, "persist", "", false, "tells router to persist its configuration in non-clustered setup")
+
+	rootCmd.PersistentFlags().IntVarP(&routerPort, "router-port", "", 0, "router PostgreSQL port")
+	rootCmd.PersistentFlags().IntVarP(&routerROPort, "router-ro-port", "", 0, "router read-only PostgreSQL port")
+	rootCmd.PersistentFlags().IntVarP(&adminPort, "admin-port", "", 0, "router Metadata PostgreSQL interface admin port")
+	rootCmd.PersistentFlags().IntVarP(&grpcPort, "grpc-port", "", 0, "router Metadata GRPC interface admin port")
 
 	rootCmd.PersistentFlags().BoolVarP(&pgprotoDebug, "proto-debug", "", false, "reply router notice, warning, etc")
 	rootCmd.AddCommand(runCmd)
@@ -135,6 +146,10 @@ var runCmd = &cobra.Command{
 			spqrlog.Zero.Debug().Msg("daemon started")
 		}
 
+		if rcfg.UseCoordinatorInit && rcfg.UseInitSQL {
+			return fmt.Errorf("cannot use initSQL and coordinator-based init simultaneously")
+		}
+
 		ctx, cancelCtx := context.WithCancel(context.Background())
 		defer cancelCtx()
 
@@ -181,7 +196,24 @@ var runCmd = &cobra.Command{
 		/* will change on reload */
 		rcfg.PgprotoDebug = rcfg.PgprotoDebug || pgprotoDebug
 		rcfg.ShowNoticeMessages = rcfg.ShowNoticeMessages || pgprotoDebug
-		router, err := router.NewRouter(ctx, rcfg, os.Getenv("NOTIFY_SOCKET"), persist)
+
+		if routerPort != 0 {
+			rcfg.RouterPort = strconv.FormatInt(int64(routerPort), 10)
+		}
+
+		if routerROPort != 0 {
+			rcfg.RouterROPort = strconv.FormatInt(int64(routerROPort), 10)
+		}
+
+		if adminPort != 0 {
+			rcfg.AdminConsolePort = strconv.FormatInt(int64(adminPort), 10)
+		}
+
+		if grpcPort != 0 {
+			rcfg.GrpcApiPort = strconv.FormatInt(int64(grpcPort), 10)
+		}
+
+		router, err := instance.NewRouter(ctx, rcfg, os.Getenv("NOTIFY_SOCKET"), persist)
 		if err != nil {
 			return errors.Wrap(err, "router failed to start")
 		}
@@ -285,6 +317,26 @@ var runCmd = &cobra.Command{
 			}
 		}()
 
+		/* initialize metadata */
+		if rcfg.UseInitSQL {
+			i := instance.NewInitSQLMetadataBootstraper(rcfg.InitSQL)
+			if err := i.InitializeMetadata(ctx, router); err != nil {
+				return err
+			}
+		} else if rcfg.UseCoordinatorInit {
+			/* load config if not yet */
+			if err := config.LoadCoordinatorCfg(ccfgPath); err != nil {
+				return err
+			}
+			e := instance.NewEtcdMetadataBootstraper(config.CoordinatorConfig().QdbAddr)
+			if err := e.InitializeMetadata(ctx, router); err != nil {
+				return err
+			}
+		} else {
+			/* TODO: maybe error-out? */
+			router.Initialize()
+		}
+
 		wg := &sync.WaitGroup{}
 
 		wg.Add(1)
@@ -308,6 +360,15 @@ var runCmd = &cobra.Command{
 		wg.Add(1)
 		go func(wg *sync.WaitGroup) {
 			err := app.ServeAdminConsole(ctx)
+			if err != nil {
+				spqrlog.Zero.Error().Err(err).Msg("")
+			}
+			wg.Done()
+		}(wg)
+
+		wg.Add(1)
+		go func(wg *sync.WaitGroup) {
+			err := app.ServceUnixSocket(ctx)
 			if err != nil {
 				spqrlog.Zero.Error().Err(err).Msg("")
 			}

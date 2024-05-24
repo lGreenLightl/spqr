@@ -3,6 +3,7 @@ package qdb
 import (
 	"context"
 	"fmt"
+
 	"github.com/pg-sharding/spqr/pkg/config"
 )
 
@@ -13,6 +14,8 @@ type ShardingSchemaKeeper interface {
 	ListKeyRangeMoves(ctx context.Context) ([]*MoveKeyRange, error)
 	/* mark key range move as completed */
 	UpdateKeyRangeMoveStatus(ctx context.Context, moveId string, s MoveKeyRangeStatus) error
+	// DeleteKeyRangeMove deletes info about key range move
+	DeleteKeyRangeMove(ctx context.Context, moveId string) error
 }
 
 type TopolodyKeeper interface {
@@ -44,7 +47,7 @@ type DistributedXactKepper interface {
 * implementation to keep the distributed state in sync.
  */
 type QDB interface {
-	AddKeyRange(ctx context.Context, keyRange *KeyRange) error
+	CreateKeyRange(ctx context.Context, keyRange *KeyRange) error
 	GetKeyRange(ctx context.Context, id string) (*KeyRange, error)
 	UpdateKeyRange(ctx context.Context, keyRange *KeyRange) error
 	DropKeyRange(ctx context.Context, id string) error
@@ -108,15 +111,14 @@ func NewXQDB(qdbType string) (XQDB, error) {
 type TxStatus string
 
 const (
-	Commited   = TxStatus("commit")
-	Processing = TxStatus("process")
+	Planned    = TxStatus("planned")
+	DataCopied = TxStatus("data_copied")
 )
 
+// DataTransferTransaction contains information about data transfer
+// from one shard to another
 type DataTransferTransaction struct {
 	ToShardId   string   `json:"to_shard"`
 	FromShardId string   `json:"from_shard"`
-	FromTxName  string   `json:"from_transaction"`
-	ToTxName    string   `json:"to_transaction"`
-	FromStatus  TxStatus `json:"from_tx_status"`
-	ToStatus    TxStatus `json:"to_tx_status"`
+	Status      TxStatus `json:"status"`
 }

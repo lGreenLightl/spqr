@@ -26,6 +26,7 @@ type Console interface {
 	ProcessQuery(ctx context.Context, q string, cl client.Client) error
 	Qlog() qlog.Qlog
 	Shutdown() error
+	Mgr() meta.EntityMgr
 }
 
 type LocalInstanceConsole struct {
@@ -41,6 +42,10 @@ var _ Console = &LocalInstanceConsole{}
 
 func (l *LocalInstanceConsole) Shutdown() error {
 	return nil
+}
+
+func (l *LocalInstanceConsole) Mgr() meta.EntityMgr {
+	return l.InstanceMgr
 }
 
 func NewLocalInstanceConsole(mgr meta.EntityMgr, rrouter rulerouter.RuleRouter, stchan chan struct{}, writer workloadlog.WorkloadLog) (Console, error) { // add writer class
@@ -90,7 +95,7 @@ func (l *LocalInstanceConsole) proxyProc(ctx context.Context, tstmt spqrparser.S
 			if err != nil {
 				return err
 			}
-			conn, err := grpc.Dial(coordAddr, grpc.WithInsecure()) //nolint:all
+			conn, err := grpc.NewClient(coordAddr, grpc.WithInsecure()) //nolint:all
 			if err != nil {
 				return err
 			}
@@ -102,7 +107,7 @@ func (l *LocalInstanceConsole) proxyProc(ctx context.Context, tstmt spqrparser.S
 		if err != nil {
 			return err
 		}
-		conn, err := grpc.Dial(coordAddr, grpc.WithInsecure()) //nolint:all
+		conn, err := grpc.NewClient(coordAddr, grpc.WithInsecure()) //nolint:all
 		if err != nil {
 			return err
 		}

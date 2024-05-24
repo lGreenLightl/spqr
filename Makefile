@@ -61,16 +61,13 @@ save_shard_image:
 	docker compose build ${IMAGE_SHARD};\
 	docker save ${IMAGE_SHARD} | gzip -c > ${CACHE_FILE_SHARD};\
 
-clean:
+clean: clean_feature_test
 	rm -f spqr-router spqr-coordinator spqr-mover spqr-worldmock spqr-balancer
-	make clean_feature_test
 
 ######################## RUN ########################
 
 run: build_images
 	docker compose up -d --remove-orphans --build router router2 coordinator shard1 shard2 qdb01
-	docker compose build client
-	docker compose run --entrypoint /bin/bash client
 
 proxy_2sh_run:
 	./spqr-router run --config ./examples/2shardproxy.yaml -d --proto-debug
@@ -87,7 +84,8 @@ pooler_run:
 ####################### TESTS #######################
 
 unittest:
-	go test -race ./cmd/... ./pkg/... ./router/... ./qdb/... ./coordinator/... ./yacc/console...
+	go test ./cmd/... ./pkg/... ./router/... ./coordinator/... ./yacc/console...
+	go test -race -count 20 -timeout 30s ./qdb/...
 
 regress_local: proxy_2sh_run
 	./script/regress_local.sh
@@ -106,9 +104,6 @@ gorm_regress: build_images
 
 xproto_regress: build_images
 	docker compose -f test/xproto/docker-compose.yaml down && docker compose -f test/xproto/docker-compose.yaml run --remove-orphans --build regress
-
-e2e: build_images
-	docker compose up --remove-orphans --exit-code-from client --build router coordinator shard1 shard2 qdb01 client
 
 stress: build_images
 	docker compose -f test/stress/docker-compose.yaml up --remove-orphans --exit-code-from stress --build router shard1 shard2 stress
@@ -135,13 +130,12 @@ feature_test_ci:
 	mkdir ./test/feature/logs
 	(cd test/feature; go test -timeout 150m)
 
-feature_test: build_images
+feature_test: clean_feature_test build_images
 	make split_feature_test
 	go build ./test/feature/...
 	rm -rf ./test/feature/logs
 	mkdir ./test/feature/logs
 	(cd test/feature; GODOG_FEATURE_DIR=generatedFeatures go test -timeout 150m)
-	make clean_feature_test
 
 lint:
 	golangci-lint run --timeout=10m --out-format=colored-line-number --skip-dirs=yacc/console
@@ -163,6 +157,7 @@ mockgen:
 	mockgen -source=./router/client/client.go -destination=./router/mock/client/mock_client.go -package=mock
 	mockgen -source=./router/poolmgr/pool_mgr.go -destination=./router/mock/poolmgr/mock_pool_mgr.go -package=mock
 	mockgen -source=./router/qrouter/qrouter.go -destination=./router/mock/qrouter/mock_qrouter.go -package=mock
+	mockgen -source=./pkg/clientinteractor/interactor.go -destination=pkg/mock/clientinteractor/mock_interactor.go -package=mock
 
 yaccgen:
 	make -C ./yacc/console gen

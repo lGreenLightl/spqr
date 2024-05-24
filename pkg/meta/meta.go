@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"fmt"
+
 	"github.com/pg-sharding/spqr/pkg/client"
 	"github.com/pg-sharding/spqr/pkg/clientinteractor"
 	"github.com/pg-sharding/spqr/pkg/config"
@@ -37,6 +38,18 @@ type EntityMgr interface {
 var unknownCoordinatorCommand = fmt.Errorf("unknown coordinator cmd")
 
 // TODO : unit tests
+
+// processDrop processes the drop command based on the type of statement provided.
+//
+// Parameters:
+// - ctx (context.Context): The context for the request.
+// - dstmt (spqrparser.Statement): The statement to be processed.
+// - isCascade (bool): Indicates whether cascade is enabled.
+// - mngr (EntityMgr): The entity manager handling the drop operation.
+// - cli (*clientinteractor.PSQLInteractor): The PSQL interactor for reporting errors.
+//
+// Returns:
+// - error: An error if drop operation fails, otherwise nil.
 func processDrop(ctx context.Context, dstmt spqrparser.Statement, isCascade bool, mngr EntityMgr, cli *clientinteractor.PSQLInteractor) error {
 	switch stmt := dstmt.(type) {
 	case *spqrparser.KeyRangeSelector:
@@ -132,12 +145,29 @@ func processDrop(ctx context.Context, dstmt spqrparser.Statement, isCascade bool
 			return err
 		}
 		return cli.DropShard(stmt.ID)
+	case *spqrparser.TaskGroupSelector:
+		if err := mngr.RemoveTaskGroup(ctx); err != nil {
+			return err
+		}
+		return cli.DropTaskGroup(ctx)
 	default:
 		return fmt.Errorf("unknown drop statement")
 	}
 }
 
 // TODO : unit tests
+
+// processCreate processes the given astmt statement of type spqrparser.Statement by creating a new distribution,
+// sharding rule, key range, or data shard depending on the type of the statement.
+//
+// Parameters:
+// - ctx (context.Context): The context of the operation.
+// - astmt (spqrparser.Statement): The statement to be processed.
+// - mngr (EntityMgr): The entity manager used to manage the entities.
+// - cli (*clientinteractor.PSQLInteractor): The PSQL interactor used to interact with the PSQL client.
+//
+// Returns:
+// - error: An error if the creation encounters any issues.
 func processCreate(ctx context.Context, astmt spqrparser.Statement, mngr EntityMgr, cli *clientinteractor.PSQLInteractor) error {
 	switch stmt := astmt.(type) {
 	case *spqrparser.DistributionDefinition:
@@ -163,11 +193,11 @@ func processCreate(ctx context.Context, astmt spqrparser.Statement, mngr EntityM
 		return cli.ReportError(spqrerror.ShardingKeysRemoved)
 	case *spqrparser.KeyRangeDefinition:
 		req := kr.KeyRangeFromSQL(stmt)
-		if err := mngr.AddKeyRange(ctx, req); err != nil {
+		if err := mngr.CreateKeyRange(ctx, req); err != nil {
 			spqrlog.Zero.Error().Err(err).Msg("Error when adding key range")
 			return cli.ReportError(err)
 		}
-		return cli.AddKeyRange(ctx, req)
+		return cli.CreateKeyRange(ctx, req)
 	case *spqrparser.ShardDefinition:
 		dataShard := datashards.NewDataShard(stmt.Id, &config.Shard{
 			Hosts: stmt.Hosts,
@@ -182,6 +212,16 @@ func processCreate(ctx context.Context, astmt spqrparser.Statement, mngr EntityM
 	}
 }
 
+// processAlter processes the given alter statement and performs the corresponding operation.
+//
+// Parameters:
+// - ctx (context.Context): The context for the operation.
+// - astmt (spqrparser.Statement): The alter statement to be processed.
+// - mngr (EntityMgr): The entity manager for managing entities.
+// - cli (*clientinteractor.PSQLInteractor): The PSQL client interactor for interacting with the PSQL server.
+//
+// Returns:
+// - error: An error if the operation fails, otherwise nil.
 func processAlter(ctx context.Context, astmt spqrparser.Statement, mngr EntityMgr, cli *clientinteractor.PSQLInteractor) error {
 	switch stmt := astmt.(type) {
 	case *spqrparser.AlterDistribution:
@@ -191,6 +231,16 @@ func processAlter(ctx context.Context, astmt spqrparser.Statement, mngr EntityMg
 	}
 }
 
+// processAlterDistribution processes the given alter distribution statement and performs the corresponding operation.
+//
+// Parameters:
+// - ctx (context.Context): The context for the operation.
+// - astmt (spqrparser.Statement): The alter distribution statement to be processed.
+// - mngr (EntityMgr): The entity manager for managing entities.
+// - cli (*clientinteractor.PSQLInteractor): The PSQL client interactor for interacting with the PSQL server.
+//
+// Returns:
+// - error: An error if the operation fails, otherwise nil.
 func processAlterDistribution(ctx context.Context, astmt spqrparser.Statement, mngr EntityMgr, cli *clientinteractor.PSQLInteractor) error {
 	switch stmt := astmt.(type) {
 	case *spqrparser.AttachRelation:
@@ -215,6 +265,19 @@ func processAlterDistribution(ctx context.Context, astmt spqrparser.Statement, m
 }
 
 // TODO : unit tests
+
+// Proc processes various coordinator commands based on the provided statement.
+//
+// Parameters:
+// - ctx (context.Context): The context for the function.
+// - tstmt (spqrparser.Statement): The statement to be processed.
+// - mgr (EntityMgr): The entity manager.
+// - ci (connectiterator.ConnectIterator): The connect iterator.
+// - cli (*clientinteractor.PSQLInteractor): The PSQL interactor.
+// - writer (workloadlog.WorkloadLog): The workload log writer.
+//
+// Returns:
+// - error: An error if the operation fails, otherwise nil.
 func Proc(ctx context.Context, tstmt spqrparser.Statement, mgr EntityMgr, ci connectiterator.ConnectIterator, cli *clientinteractor.PSQLInteractor, writer workloadlog.WorkloadLog) error {
 	spqrlog.Zero.Debug().Interface("tstmt", tstmt).Msg("proc query")
 	switch stmt := tstmt.(type) {
@@ -309,6 +372,18 @@ func Proc(ctx context.Context, tstmt spqrparser.Statement, mgr EntityMgr, ci con
 }
 
 // TODO : unit tests
+
+// ProcessKill processes the kill command based on the statement provided.
+//
+// Parameters:
+// - ctx (context.Context): The context for the operation.
+// - stmt (*spqrparser.Kill): The kill statement to process.
+// - mngr (EntityMgr): The entity manager for managing entities.
+// - pool (client.Pool): The pool of clients.
+// - cli (*clientinteractor.PSQLInteractor): The PSQL interactor for client interactions.
+//
+// Returns:
+// - error: An error if the operation encounters any issues.
 func ProcessKill(ctx context.Context, stmt *spqrparser.Kill, mngr EntityMgr, pool client.Pool, cli *clientinteractor.PSQLInteractor) error {
 	spqrlog.Zero.Debug().Str("cmd", stmt.Cmd).Msg("process kill")
 	switch stmt.Cmd {
@@ -327,6 +402,18 @@ func ProcessKill(ctx context.Context, stmt *spqrparser.Kill, mngr EntityMgr, poo
 }
 
 // TODO : unit tests
+
+// ProcessShow processes the SHOW statement and returns an error if any issue occurs.
+//
+// Parameters:
+// - ctx (context.Context): The context for the operation.
+// - stmt (*spqrparser.Show): The SHOW statement to process.
+// - mngr (EntityMgr): The entity manager for managing entities.
+// - ci (connectiterator.ConnectIterator): The connect iterator for connection interactions.
+// - cli (*clientinteractor.PSQLInteractor): The PSQL interactor for client interactions.
+//
+// Returns:
+// - error: An error if the operation encounters any issues.
 func ProcessShow(ctx context.Context, stmt *spqrparser.Show, mngr EntityMgr, ci connectiterator.ConnectIterator, cli *clientinteractor.PSQLInteractor) error {
 	spqrlog.Zero.Debug().Str("cmd", stmt.Cmd).Msg("process show statement")
 	switch stmt.Cmd {
@@ -413,6 +500,23 @@ func ProcessShow(ctx context.Context, stmt *spqrparser.Show, mngr EntityMgr, ci 
 		}
 
 		return cli.Relations(dsToRels, stmt.Where)
+	case spqrparser.TaskGroupStr:
+		group, err := mngr.GetTaskGroup(ctx)
+		if err != nil {
+			return err
+		}
+		return cli.Tasks(ctx, group.Tasks)
+	case spqrparser.PreparedStatementsStr:
+
+		var resp []shard.PreparedStatementsMgrDescriptor
+		if err := ci.ForEach(func(sh shard.Shardinfo) error {
+			resp = append(resp, sh.ListPreparedStatements()...)
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		return cli.PreparedStatements(ctx, resp)
 	default:
 		return unknownCoordinatorCommand
 	}

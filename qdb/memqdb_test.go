@@ -31,10 +31,7 @@ var mockRouter = &qdb.Router{
 var mockDataTransferTransaction = &qdb.DataTransferTransaction{
 	ToShardId:   mockShard.ID,
 	FromShardId: mockShard.ID,
-	FromTxName:  "fake_tx_1",
-	ToTxName:    "fake_tx_2",
-	FromStatus:  "fake_st_1",
-	ToStatus:    "fake_st_2",
+	Status:      "fake_st",
 }
 
 // must run with -race
@@ -49,7 +46,7 @@ func TestMemqdbRacing(t *testing.T) {
 
 	methods := []func(){
 		func() { _ = memqdb.CreateDistribution(ctx, mockDistribution) },
-		func() { _ = memqdb.AddKeyRange(ctx, mockKeyRange) },
+		func() { _ = memqdb.CreateKeyRange(ctx, mockKeyRange) },
 		func() { _ = memqdb.AddRouter(ctx, mockRouter) },
 		func() { _ = memqdb.AddShard(ctx, mockShard) },
 		func() {
@@ -73,7 +70,7 @@ func TestMemqdbRacing(t *testing.T) {
 		func() { _ = memqdb.UpdateKeyRange(ctx, mockKeyRange) },
 		func() { _ = memqdb.DeleteRouter(ctx, mockRouter.ID) },
 	}
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 1000; i++ {
 		for _, m := range methods {
 			wg.Add(1)
 			go func(m func()) {
@@ -193,18 +190,59 @@ func TestKeyRanges(t *testing.T) {
 
 	assert.NoError(err)
 
-	assert.NoError(memqdb.AddKeyRange(ctx, &qdb.KeyRange{
+	assert.NoError(memqdb.CreateKeyRange(ctx, &qdb.KeyRange{
 		LowerBound:     []byte("1111"),
 		ShardID:        "sh1",
 		KeyRangeID:     "krid1",
 		DistributionId: "ds1",
 	}))
 
-	assert.Error(memqdb.AddKeyRange(ctx, &qdb.KeyRange{
+	assert.Error(memqdb.CreateKeyRange(ctx, &qdb.KeyRange{
 		LowerBound:     []byte("1111"),
 		ShardID:        "sh1",
 		KeyRangeID:     "krid2",
 		DistributionId: "dserr",
 	}))
 
+}
+
+func Test_MemQDB_GetKeyRange(t *testing.T) {
+
+	assert := assert.New(t)
+
+	memqdb, err := qdb.RestoreQDB(MemQDBPath)
+	assert.NoError(err)
+
+	ctx := context.TODO()
+
+	err = memqdb.CreateDistribution(ctx, qdb.NewDistribution("ds1", nil))
+	assert.NoError(err)
+
+	err = memqdb.CreateDistribution(ctx, qdb.NewDistribution("ds2", nil))
+	assert.NoError(err)
+
+	keyRange1 := qdb.KeyRange{
+		LowerBound:     []byte("1111"),
+		ShardID:        "sh1",
+		KeyRangeID:     "krid1",
+		DistributionId: "ds1",
+	}
+	assert.NoError(memqdb.CreateKeyRange(ctx, &keyRange1))
+
+	keyRange2 := qdb.KeyRange{
+		LowerBound:     []byte("1111"),
+		ShardID:        "sh1",
+		KeyRangeID:     "krid2",
+		DistributionId: "ds2",
+	}
+	assert.NoError(memqdb.CreateKeyRange(ctx, &keyRange2))
+
+	res, _ := memqdb.GetKeyRange(ctx, keyRange1.KeyRangeID)
+	assert.Equal(keyRange1.ShardID, res.ShardID)
+	assert.Equal(keyRange1.KeyRangeID, res.KeyRangeID)
+	assert.Equal(keyRange1.DistributionId, res.DistributionId)
+	assert.Equal(keyRange1.LowerBound, res.LowerBound)
+
+	_, err = memqdb.GetKeyRange(ctx, "krid3")
+	assert.NotNil(err)
 }

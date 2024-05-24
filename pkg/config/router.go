@@ -52,7 +52,10 @@ type Router struct {
 	WorldShardFallback bool `json:"world_shard_fallback" toml:"world_shard_fallback" yaml:"world_shard_fallback"`
 	ShowNoticeMessages bool `json:"show_notice_messages" toml:"show_notice_messages" yaml:"show_notice_messages"`
 
-	InitSQL          string            `json:"init_sql" toml:"init_sql" yaml:"init_sql"`
+	InitSQL            string `json:"init_sql" toml:"init_sql" yaml:"init_sql"`
+	UseInitSQL         bool   `json:"use_init_sql" toml:"use_init_sql" yaml:"use_init_sql"`
+	UseCoordinatorInit bool   `json:"use_coordinator_init" toml:"use_coordinator_init" yaml:"use_coordinator_init"`
+
 	MemqdbBackupPath string            `json:"memqdb_backup_path" toml:"memqdb_backup_path" yaml:"memqdb_backup_path"`
 	MemqdbPersistent bool              `json:"memqdb_persistent" toml:"memqdb_persistent" yaml:"memqdb_persistent"`
 	RouterMode       string            `json:"router_mode" toml:"router_mode" yaml:"router_mode"`
@@ -80,18 +83,19 @@ type QRouter struct {
 }
 
 type BackendRule struct {
-	DB                string              `json:"db" yaml:"db" toml:"db"`
-	Usr               string              `json:"usr" yaml:"usr" toml:"usr"`
-	AuthRules         map[string]*AuthCfg `json:"auth_rules" yaml:"auth_rules" toml:"auth_rules"` // TODO validate
-	DefaultAuthRule   *AuthCfg            `json:"auth_rule" yaml:"auth_rule" toml:"auth_rule"`
-	PoolDefault       bool                `json:"pool_default" yaml:"pool_default" toml:"pool_default"`
-	ConnectionLimit   int                 `json:"connection_limit" yaml:"connection_limit" toml:"connection_limit"`
-	ConnectionRetries int                 `json:"connection_retries" yaml:"connection_retries" toml:"connection_retries"`
+	DB                string                     `json:"db" yaml:"db" toml:"db"`
+	Usr               string                     `json:"usr" yaml:"usr" toml:"usr"`
+	AuthRules         map[string]*AuthBackendCfg `json:"auth_rules" yaml:"auth_rules" toml:"auth_rules"` // TODO validate
+	DefaultAuthRule   *AuthBackendCfg            `json:"auth_rule" yaml:"auth_rule" toml:"auth_rule"`
+	PoolDefault       bool                       `json:"pool_default" yaml:"pool_default" toml:"pool_default"`
+	ConnectionLimit   int                        `json:"connection_limit" yaml:"connection_limit" toml:"connection_limit"`
+	ConnectionRetries int                        `json:"connection_retries" yaml:"connection_retries" toml:"connection_retries"`
 }
 
 type FrontendRule struct {
 	DB                    string   `json:"db" yaml:"db" toml:"db"`
 	Usr                   string   `json:"usr" yaml:"usr" toml:"usr"`
+	SearchPath            string   `json:"search_path" yaml:"search_path" toml:"search_path"`
 	AuthRule              *AuthCfg `json:"auth_rule" yaml:"auth_rule" toml:"auth_rule"` // TODO validate
 	PoolMode              PoolMode `json:"pool_mode" yaml:"pool_mode" toml:"pool_mode"`
 	PoolDiscard           bool     `json:"pool_discard" yaml:"pool_discard" toml:"pool_discard"`
@@ -113,6 +117,13 @@ type Shard struct {
 	TLS   *TLSConfig `json:"tls" yaml:"tls" toml:"tls"`
 }
 
+// LoadRouterCfg loads the router configuration from the specified file path.
+//
+// Parameters:
+//   - cfgPath (string): The path of the configuration file.
+//
+// Returns:
+//   - error: An error if any occurred during the loading process.
 func LoadRouterCfg(cfgPath string) error {
 	var rcfg Router
 	file, err := os.Open(cfgPath)
@@ -145,6 +156,14 @@ func LoadRouterCfg(cfgPath string) error {
 	return nil
 }
 
+// initRouterConfig initializes the router configuration from a file.
+//
+// Parameters:
+// - file: *os.File - the file to read the configuration from.
+// - cfgRouter: *Router - a pointer to the router configuration struct.
+//
+// Returns:
+// - error: an error if the configuration file format is unknown or if there was an error decoding the file.
 func initRouterConfig(file *os.File, cfgRouter *Router) error {
 	if strings.HasSuffix(file.Name(), ".toml") {
 		_, err := toml.NewDecoder(file).Decode(cfgRouter)
@@ -159,6 +178,13 @@ func initRouterConfig(file *os.File, cfgRouter *Router) error {
 	return fmt.Errorf("unknown config format type: %s. Use .toml, .yaml or .json suffix in filename", file.Name())
 }
 
+// RouterConfig returns the router configuration.
+//
+// Parameters:
+// - None.
+//
+// Returns:
+// - *Router: a pointer to the router configuration struct.
 func RouterConfig() *Router {
 	return &cfgRouter
 }

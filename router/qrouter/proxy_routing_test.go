@@ -143,7 +143,7 @@ func TestComment(t *testing.T) {
 		},
 	})
 
-	err := db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err := db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh1",
 		DistributionId: distribution,
 		KeyRangeID:     "id1",
@@ -152,7 +152,7 @@ func TestComment(t *testing.T) {
 
 	assert.NoError(err)
 
-	err = db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err = db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh2",
 		KeyRangeID:     "id2",
 		DistributionId: distribution,
@@ -205,6 +205,178 @@ func TestComment(t *testing.T) {
 		assert.NoError(err, "query %s", tt.query)
 
 		assert.Equal(tt.exp, tmp)
+	}
+}
+
+func TestCTE(t *testing.T) {
+	assert := assert.New(t)
+
+	type tcase struct {
+		query string
+		exp   routingstate.RoutingState
+		err   error
+	}
+	/* TODO: fix by adding configurable setting */
+	db, _ := qdb.NewMemQDB(MemQDBPath)
+	distribution := "dd"
+
+	_ = db.CreateDistribution(context.TODO(), &qdb.Distribution{
+		ID: distribution,
+		Relations: map[string]*qdb.DistributedRelation{
+			"t": {
+				Name: "t",
+				DistributionKey: []qdb.DistributionKeyEntry{
+					{
+						Column: "i",
+					},
+				},
+			},
+		},
+	})
+
+	err := db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
+		ShardID:        "sh1",
+		DistributionId: distribution,
+		KeyRangeID:     "id1",
+		LowerBound:     []byte("1"),
+	})
+
+	assert.NoError(err)
+
+	err = db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
+		ShardID:        "sh2",
+		DistributionId: distribution,
+		KeyRangeID:     "id2",
+		LowerBound:     []byte("11"),
+	})
+
+	assert.NoError(err)
+
+	lc := local.NewLocalCoordinator(db)
+
+	pr, err := qrouter.NewProxyRouter(map[string]*config.Shard{
+		"sh1": {
+			Hosts: nil,
+		},
+		"sh2": {
+			Hosts: nil,
+		},
+	}, lc, &config.QRouter{
+		DefaultRouteBehaviour: "BLOCK",
+	})
+
+	assert.NoError(err)
+
+	for _, tt := range []tcase{
+
+		{
+			query: `
+			WITH xxxx AS (
+				SELECT * from t where i = 1
+			)
+			SELECT * from xxxx;
+			`,
+			err: nil,
+			exp: routingstate.ShardMatchState{
+				Route: &routingstate.DataShardRoute{
+					Shkey: kr.ShardKey{
+						Name: "sh1",
+					},
+					Matchedkr: &kr.KeyRange{
+						ShardID:      "sh1",
+						ID:           "id1",
+						Distribution: distribution,
+						LowerBound:   []byte("1"),
+					},
+				},
+				TargetSessionAttrs: "any",
+			},
+		},
+		{
+			query: `
+			WITH xxxx AS (
+				SELECT * from t where i = 1
+			),
+			zzzz AS (
+				UPDATE t 
+				SET a = 0
+				WHERE i = 1 AND (SELECT COUNT(*) FROM xxxx WHERE b = 0) = 1
+			)	
+			SELECT * FROM xxxx;
+			`,
+			err: nil,
+			exp: routingstate.ShardMatchState{
+				Route: &routingstate.DataShardRoute{
+					Shkey: kr.ShardKey{
+						Name: "sh1",
+					},
+					Matchedkr: &kr.KeyRange{
+						ShardID:      "sh1",
+						ID:           "id1",
+						Distribution: distribution,
+						LowerBound:   []byte("1"),
+					},
+				},
+				TargetSessionAttrs: "any",
+			},
+		},
+		{
+			query: `
+			WITH xxxx AS (
+			SELECT * from t where i = 1
+		),
+			zzzz AS (
+				UPDATE t
+				SET a = 0
+				WHERE i = 12
+			)
+			SELECT * FROM xxxx;
+			`,
+			err: nil,
+			exp: routingstate.SkipRoutingState{},
+		},
+		{
+			query: `
+			WITH xxxx AS (
+				SELECT * from t where i = 1
+			),
+			zzzz AS (
+				UPDATE t
+				SET a = 0
+				WHERE i = 2
+			)
+			SELECT * FROM xxxx;
+			`,
+			err: nil,
+			exp: routingstate.ShardMatchState{
+				Route: &routingstate.DataShardRoute{
+					Shkey: kr.ShardKey{
+						Name: "sh1",
+					},
+					Matchedkr: &kr.KeyRange{
+						ShardID:      "sh1",
+						ID:           "id1",
+						Distribution: distribution,
+						LowerBound:   []byte("1"),
+					},
+				},
+				TargetSessionAttrs: "any",
+			},
+		},
+	} {
+		parserRes, err := lyx.Parse(tt.query)
+
+		assert.NoError(err, "query %s", tt.query)
+
+		tmp, err := pr.Route(context.TODO(), parserRes, session.NewDummyHandler(distribution))
+
+		if tt.err == nil {
+			assert.NoError(err, "query %s", tt.query)
+		} else {
+			assert.Error(err, "query %s", tt.query)
+		}
+
+		assert.Equal(tt.exp, tmp, tt.query)
 	}
 }
 
@@ -266,7 +438,7 @@ func TestSingleShard(t *testing.T) {
 		},
 	})
 
-	err := db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err := db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh1",
 		DistributionId: distribution,
 		KeyRangeID:     "id1",
@@ -275,7 +447,7 @@ func TestSingleShard(t *testing.T) {
 
 	assert.NoError(err)
 
-	err = db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err = db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh2",
 		DistributionId: distribution,
 		KeyRangeID:     "id2",
@@ -486,6 +658,43 @@ func TestSingleShard(t *testing.T) {
 			},
 			err: nil,
 		},
+
+		{
+			query: "SELECT * FROM t WHERE i = 12 AND j = 1;",
+			exp: routingstate.ShardMatchState{
+				Route: &routingstate.DataShardRoute{
+					Shkey: kr.ShardKey{
+						Name: "sh2",
+					},
+					Matchedkr: &kr.KeyRange{
+						ShardID:      "sh2",
+						ID:           "id2",
+						Distribution: distribution,
+						LowerBound:   []byte("11"),
+					},
+				},
+				TargetSessionAttrs: "any",
+			},
+			err: nil,
+		},
+		{
+			query: "SELECT * FROM t WHERE i = 12 UNION ALL SELECT * FROM xxmixed WHERE i = 22;",
+			exp: routingstate.ShardMatchState{
+				Route: &routingstate.DataShardRoute{
+					Shkey: kr.ShardKey{
+						Name: "sh2",
+					},
+					Matchedkr: &kr.KeyRange{
+						ShardID:      "sh2",
+						ID:           "id2",
+						Distribution: distribution,
+						LowerBound:   []byte("11"),
+					},
+				},
+				TargetSessionAttrs: "any",
+			},
+			err: nil,
+		},
 	} {
 		parserRes, err := lyx.Parse(tt.query)
 
@@ -541,7 +750,7 @@ func TestInsertOffsets(t *testing.T) {
 		},
 	})
 
-	err := db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err := db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh1",
 		KeyRangeID:     "id1",
 		DistributionId: distribution,
@@ -550,7 +759,7 @@ func TestInsertOffsets(t *testing.T) {
 
 	assert.NoError(err)
 
-	err = db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err = db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh2",
 		DistributionId: distribution,
 		KeyRangeID:     "id2",
@@ -730,7 +939,7 @@ func TestJoins(t *testing.T) {
 		},
 	})
 
-	err := db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err := db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh1",
 		KeyRangeID:     "id1",
 		DistributionId: distribution,
@@ -739,7 +948,7 @@ func TestJoins(t *testing.T) {
 
 	assert.NoError(err)
 
-	err = db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err = db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh2",
 		KeyRangeID:     "id2",
 		DistributionId: distribution,
@@ -855,7 +1064,7 @@ func TestUnnest(t *testing.T) {
 		},
 	})
 
-	err := db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err := db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh1",
 		KeyRangeID:     "id1",
 		DistributionId: distribution,
@@ -864,7 +1073,7 @@ func TestUnnest(t *testing.T) {
 
 	assert.NoError(err)
 
-	err = db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err = db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh2",
 		DistributionId: distribution,
 		KeyRangeID:     "id2",
@@ -966,7 +1175,7 @@ func TestCopySingleShard(t *testing.T) {
 		},
 	})
 
-	err := db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err := db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh1",
 		DistributionId: distribution,
 		KeyRangeID:     "id1",
@@ -975,7 +1184,7 @@ func TestCopySingleShard(t *testing.T) {
 
 	assert.NoError(err)
 
-	err = db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err = db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh2",
 		DistributionId: distribution,
 		KeyRangeID:     "id2",
@@ -1047,7 +1256,7 @@ func TestSetStmt(t *testing.T) {
 	assert.NoError(db.CreateDistribution(context.TODO(), qdb.NewDistribution(distribution1, nil)))
 	assert.NoError(db.CreateDistribution(context.TODO(), qdb.NewDistribution(distribution2, nil)))
 
-	err := db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err := db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh1",
 		DistributionId: distribution1,
 		KeyRangeID:     "id1",
@@ -1056,7 +1265,7 @@ func TestSetStmt(t *testing.T) {
 
 	assert.NoError(err)
 
-	err = db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err = db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh2",
 		DistributionId: distribution2,
 		KeyRangeID:     "id2",
@@ -1128,7 +1337,7 @@ func TestMiscRouting(t *testing.T) {
 	assert.NoError(db.CreateDistribution(context.TODO(), qdb.NewDistribution(distribution1, nil)))
 	assert.NoError(db.CreateDistribution(context.TODO(), qdb.NewDistribution(distribution2, nil)))
 
-	err := db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err := db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh1",
 		DistributionId: distribution1,
 		KeyRangeID:     "id1",
@@ -1137,7 +1346,7 @@ func TestMiscRouting(t *testing.T) {
 
 	assert.NoError(err)
 
-	err = db.AddKeyRange(context.TODO(), &qdb.KeyRange{
+	err = db.CreateKeyRange(context.TODO(), &qdb.KeyRange{
 		ShardID:        "sh2",
 		DistributionId: distribution2,
 		KeyRangeID:     "id2",

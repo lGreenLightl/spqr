@@ -2,7 +2,10 @@ host: '[spqr_router_1_2]'
 router_port: '6432'
 admin_console_port: '7432'
 grpc_api_port: '7000'
+
 init_sql: /spqr/docker/router/init.sql
+use_init_sql: true
+
 router_mode: PROXY
 log_level: debug
 time_quantiles:
@@ -43,17 +46,6 @@ shards:
     type: DATA
     hosts:
       - 'spqr_shard_2:6432'
-  w1:
-    tls:
-      key_file: /etc/odyssey/ssl/server.key
-      sslmode: disable
-      cert_file: /etc/odyssey/ssl/server.crt
-    db: db1
-    usr: user1
-    pwd: 12345678
-    type: WORLD
-    hosts:
-      - 'spqr_world:6432'
 backend_rules:
   - usr: user1
     db: db1

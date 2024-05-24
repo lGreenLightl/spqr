@@ -15,7 +15,7 @@ Feature: LDAP auth test
     """
     1
     """
-  
+
   Scenario: LDAP auth works when one of the servers is dead
     Given cluster environment is
     """

@@ -37,7 +37,6 @@ import (
 	"github.com/pg-sharding/spqr/pkg/pool"
 	routerproto "github.com/pg-sharding/spqr/pkg/protos"
 	"github.com/pg-sharding/spqr/qdb"
-	router "github.com/pg-sharding/spqr/router"
 	psqlclient "github.com/pg-sharding/spqr/router/client"
 	"github.com/pg-sharding/spqr/router/port"
 	"github.com/pg-sharding/spqr/router/route"
@@ -69,7 +68,12 @@ func (ci grpcConnectionIterator) IterRouter(cb func(cc *grpc.ClientConn, addr st
 		if err != nil {
 			return err
 		}
+		defer cc.Close()
+
 		if err := cb(cc, r.Address); err != nil {
+			return err
+		}
+		if err := cc.Close(); err != nil {
 			return err
 		}
 	}
@@ -165,28 +169,12 @@ func (ci grpcConnectionIterator) ForEachPool(cb func(p pool.Pool) error) error {
 
 var _ connectiterator.ConnectIterator = &grpcConnectionIterator{}
 
-type routerConn struct {
-	routerproto.KeyRangeServiceClient
-	addr string
-	id   string
-}
-
-func (r *routerConn) Addr() string {
-	return r.addr
-}
-
-func (r *routerConn) ID() string {
-	return r.id
-}
-
-var _ router.Router = &routerConn{}
-
 func DialRouter(r *topology.Router) (*grpc.ClientConn, error) {
 	spqrlog.Zero.Debug().
 		Str("router-id", r.ID).
 		Msg("dialing router")
 	// TODO: add creds
-	return grpc.Dial(r.Address, grpc.WithInsecure()) //nolint:all
+	return grpc.NewClient(r.Address, grpc.WithInsecure()) //nolint:all
 }
 
 type CoordinatorClient interface {
@@ -238,6 +226,8 @@ func (qc *qdbCoordinator) watchRouters(ctx context.Context) {
 					return err
 				}
 
+				defer cc.Close()
+
 				rrClient := routerproto.NewTopologyServiceClient(cc)
 
 				resp, err := rrClient.GetRouterStatus(ctx, &routerproto.GetRouterStatusRequest{})
@@ -248,27 +238,29 @@ func (qc *qdbCoordinator) watchRouters(ctx context.Context) {
 				switch resp.Status {
 				case routerproto.RouterStatus_CLOSED:
 					spqrlog.Zero.Debug().Msg("router is closed")
-					if err := qc.SyncRouterMetadata(ctx, internalR); err != nil {
-						return err
-					}
-					if _, err := rrClient.OpenRouter(ctx, &routerproto.OpenRouterRequest{}); err != nil {
+					if err := qc.SyncRouterCoordinatorAddress(ctx, internalR); err != nil {
 						return err
 					}
 
 					/* Mark router as opened in qdb */
-					err := qc.db.OpenRouter(ctx, internalR.ID)
+					err := qc.db.CloseRouter(ctx, internalR.ID)
 					if err != nil {
 						return err
 					}
+
 				case routerproto.RouterStatus_OPENED:
 					spqrlog.Zero.Debug().Msg("router is opened")
 
+					/* TODO: check router metadata consistency */
+					if err := qc.SyncRouterCoordinatorAddress(ctx, internalR); err != nil {
+						return err
+					}
+
 					/* Mark router as opened in qdb */
 					err := qc.db.OpenRouter(ctx, internalR.ID)
 					if err != nil {
 						return err
 					}
-					// TODO: consistency checks
 				}
 				return nil
 			}(); err != nil {
@@ -299,7 +291,7 @@ func (qc *qdbCoordinator) lockCoordinator(ctx context.Context, initialRouter boo
 		}
 		router := &topology.Router{
 			ID:      uuid.NewString(),
-			Address: fmt.Sprintf("%s:%s", config.RouterConfig().Host, config.RouterConfig().GrpcApiPort),
+			Address: net.JoinHostPort(config.RouterConfig().Host, config.RouterConfig().GrpcApiPort),
 			State:   qdb.OPENED,
 		}
 		if err := qc.RegisterRouter(ctx, router); err != nil {
@@ -308,7 +300,7 @@ func (qc *qdbCoordinator) lockCoordinator(ctx context.Context, initialRouter boo
 		if err := qc.SyncRouterMetadata(ctx, router); err != nil {
 			spqrlog.Zero.Error().Err(err).Msg("sync router metadata when locking coordinator")
 		}
-		if err := qc.UpdateCoordinator(ctx, fmt.Sprintf("%s:%s", config.CoordinatorConfig().Host, config.CoordinatorConfig().GrpcApiPort)); err != nil {
+		if err := qc.UpdateCoordinator(ctx, net.JoinHostPort(config.CoordinatorConfig().Host, config.CoordinatorConfig().GrpcApiPort)); err != nil {
 			return false
 		}
 		return true
@@ -332,9 +324,9 @@ func (qc *qdbCoordinator) lockCoordinator(ctx context.Context, initialRouter boo
 	return registerRouter()
 }
 
-// TODO : unit tests
 // RunCoordinator side effect: it runs an asynchronous goroutine
 // that checks the availability of the SPQR router
+// TODO : unit tests
 func (qc *qdbCoordinator) RunCoordinator(ctx context.Context, initialRouter bool) {
 	if !qc.lockCoordinator(ctx, initialRouter) {
 		return
@@ -344,32 +336,39 @@ func (qc *qdbCoordinator) RunCoordinator(ctx context.Context, initialRouter bool
 	if err != nil {
 		spqrlog.Zero.Error().
 			Err(err).
-			Msg("faild to list key ranges")
+			Msg("failed to list key ranges")
 	}
 
+	// Finish any key range move or data transfer transaction in progress
 	for _, r := range ranges {
-		tx, err := qc.db.GetTransferTx(context.TODO(), r.KeyRangeID)
+		move, err := qc.GetKeyRangeMove(context.TODO(), r.KeyRangeID)
 		if err != nil {
-			continue
-		}
-		if tx.ToStatus == qdb.Commited && tx.FromStatus != qdb.Commited {
-			datatransfers.ResolvePreparedTransaction(context.TODO(), tx.FromShardId, tx.FromTxName, true)
-			tem := kr.MoveKeyRange{
-				ShardId: tx.ToShardId,
-				Krid:    r.KeyRangeID,
-			}
-			err = qc.Move(context.TODO(), &tem)
-			if err != nil {
-				spqrlog.Zero.Error().Err(err).Msg("failed to move key range")
-			}
-		} else if tx.FromStatus != qdb.Commited {
-			datatransfers.ResolvePreparedTransaction(context.TODO(), tx.ToShardId, tx.ToTxName, false)
-			datatransfers.ResolvePreparedTransaction(context.TODO(), tx.FromShardId, tx.FromTxName, false)
+			spqrlog.Zero.Error().Err(err).Msg("error getting key range move from qdb")
 		}
 
-		err = qc.db.RemoveTransferTx(context.TODO(), r.KeyRangeID)
+		tx, err := qc.db.GetTransferTx(context.TODO(), r.KeyRangeID)
 		if err != nil {
-			spqrlog.Zero.Error().Err(err).Msg("error removing from qdb")
+			spqrlog.Zero.Error().Err(err).Msg("error getting data transfer transaction from qdb")
+		}
+
+		var krm *kr.MoveKeyRange
+		if move != nil {
+			krm = &kr.MoveKeyRange{
+				Krid:    move.KeyRangeID,
+				ShardId: move.ShardId,
+			}
+		} else if tx != nil {
+			krm = &kr.MoveKeyRange{
+				Krid:    r.KeyRangeID,
+				ShardId: tx.ToShardId,
+			}
+		}
+
+		if krm != nil {
+			err = qc.Move(context.TODO(), krm)
+			if err != nil {
+				spqrlog.Zero.Error().Err(err).Msg("error moving key range")
+			}
 		}
 	}
 
@@ -401,9 +400,13 @@ func (qc *qdbCoordinator) traverseRouters(ctx context.Context, cb func(cc *grpc.
 			if err != nil {
 				return err
 			}
+			defer cc.Close()
+
+			defer cc.Close()
 
 			if err := cb(cc); err != nil {
 				spqrlog.Zero.Debug().Err(err).Str("router id", rtr.ID).Msg("traverse routers")
+				return err
 			}
 
 			return nil
@@ -440,7 +443,7 @@ func (qc *qdbCoordinator) AddRouter(ctx context.Context, router *topology.Router
 }
 
 // TODO : unit tests
-func (qc *qdbCoordinator) AddKeyRange(ctx context.Context, keyRange *kr.KeyRange) error {
+func (qc *qdbCoordinator) CreateKeyRange(ctx context.Context, keyRange *kr.KeyRange) error {
 	// add key range to metadb
 	spqrlog.Zero.Debug().
 		Bytes("lower-bound", keyRange.LowerBound).
@@ -448,14 +451,14 @@ func (qc *qdbCoordinator) AddKeyRange(ctx context.Context, keyRange *kr.KeyRange
 		Str("key-range-id", keyRange.ID).
 		Msg("add key range")
 
-	err := ops.AddKeyRangeWithChecks(ctx, qc.db, keyRange)
+	err := ops.CreateKeyRangeWithChecks(ctx, qc.db, keyRange)
 	if err != nil {
 		return err
 	}
 
 	return qc.traverseRouters(ctx, func(cc *grpc.ClientConn) error {
 		cl := routerproto.NewKeyRangeServiceClient(cc)
-		resp, err := cl.AddKeyRange(ctx, &routerproto.AddKeyRangeRequest{
+		resp, err := cl.CreateKeyRange(ctx, &routerproto.CreateKeyRangeRequest{
 			KeyRangeInfo: keyRange.ToProto(),
 		})
 
@@ -632,7 +635,7 @@ func (qc *qdbCoordinator) Split(ctx context.Context, req *kr.SplitKeyRange) erro
 		return err
 	}
 
-	if err := ops.AddKeyRangeWithChecks(ctx, qc.db, krNew); err != nil {
+	if err := ops.CreateKeyRangeWithChecks(ctx, qc.db, krNew); err != nil {
 		return spqrerror.Newf(spqrerror.SPQR_KEYRANGE_ERROR, "failed to add a new key range: %s", err.Error())
 	}
 
@@ -801,8 +804,26 @@ func (qc *qdbCoordinator) RecordKeyRangeMove(ctx context.Context, m *qdb.MoveKey
 	return m.MoveId, nil
 }
 
+func (qc *qdbCoordinator) GetKeyRangeMove(ctx context.Context, krId string) (*qdb.MoveKeyRange, error) {
+	ls, err := qc.db.ListKeyRangeMoves(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, krm := range ls {
+		// after the coordinator restarts, it will continue the move that was previously initiated.
+		// key range move already exist for this key range
+		// complete it first
+		if krm.KeyRangeID == krId {
+			return krm, nil
+		}
+	}
+
+	return nil, nil
+}
+
 // Move key range from one logical shard to another
-// This function reshards data by locking a portion of it,
+// This function re-shards data by locking a portion of it,
 // making it unavailable for read and write access during the process.
 // TODO : unit tests
 func (qc *qdbCoordinator) Move(ctx context.Context, req *kr.MoveKeyRange) error {
@@ -814,7 +835,7 @@ func (qc *qdbCoordinator) Move(ctx context.Context, req *kr.MoveKeyRange) error 
 		Str("shard-id", req.ShardId).
 		Msg("qdb coordinator move key range")
 
-	keyRange, err := qc.db.GetKeyRange(ctx, req.Krid)
+	keyRange, err := qc.GetKeyRange(ctx, req.Krid)
 	if err != nil {
 		return err
 	}
@@ -824,63 +845,91 @@ func (qc *qdbCoordinator) Move(ctx context.Context, req *kr.MoveKeyRange) error 
 		return nil
 	}
 
-	moveId, err := qc.RecordKeyRangeMove(ctx,
-		&qdb.MoveKeyRange{
+	move, err := qc.GetKeyRangeMove(ctx, req.Krid)
+	if err != nil {
+		return err
+	}
+
+	if move == nil {
+		// No key range moves in progress
+		move = &qdb.MoveKeyRange{
 			MoveId:     uuid.New().String(),
 			ShardId:    req.ShardId,
 			KeyRangeID: req.Krid,
 			Status:     qdb.MoveKeyRangePlanned,
-		})
-
-	/* NOOP if key range move was already recorded */
-	if err != nil {
-		return err
-	}
-
-	krmv, err := qc.LockKeyRange(ctx, req.Krid)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := qc.UnlockKeyRange(ctx, req.Krid); err != nil {
-			spqrlog.Zero.Error().Err(err).Msg("")
 		}
-	}()
-
-	defer func() {
-		// set compelted status in the end of key range move operation
-		if err := qc.db.UpdateKeyRangeMoveStatus(ctx, moveId, qdb.MoveKeyRangeComplete); err != nil {
-			spqrlog.Zero.Error().Err(err).Msg("")
+		_, err = qc.RecordKeyRangeMove(ctx, move)
+		if err != nil {
+			return err
 		}
-	}()
-
-	/* physical changes on shards */
-	err = datatransfers.MoveKeys(ctx, keyRange.ShardID, req.ShardId, *keyRange, qc.db)
-	if err != nil {
-		spqrlog.Zero.Error().Err(err).Msg("failed to move rows")
-		return err
 	}
 
-	// Update the state of the distributed key-range metadata
-	krmv.ShardID = req.ShardId
-	if err := ops.ModifyKeyRangeWithChecks(ctx, qc.db, krmv); err != nil {
-		// TODO: check if unlock here is ok
-		return err
-	}
+	for move != nil {
+		switch move.Status {
+		case qdb.MoveKeyRangePlanned:
+			// lock the key range
+			_, err = qc.LockKeyRange(ctx, req.Krid)
+			if err != nil {
+				return err
+			}
+			if err = qc.db.UpdateKeyRangeMoveStatus(ctx, move.MoveId, qdb.MoveKeyRangeComplete); err != nil {
+				return err
+			}
+			move.Status = qdb.MoveKeyRangeStarted
+		case qdb.MoveKeyRangeStarted:
+			// move the data
+			ds, err := qc.GetDistribution(ctx, keyRange.Distribution)
+			if err != nil {
+				return err
+			}
+			err = datatransfers.MoveKeys(ctx, keyRange.ShardID, req.ShardId, keyRange, ds, qc.db, qc)
+			if err != nil {
+				spqrlog.Zero.Error().Err(err).Msg("failed to move rows")
+				return err
+			}
 
-	// Notify all routers about scheme changes.
-	if err := qc.traverseRouters(ctx, func(cc *grpc.ClientConn) error {
-		cl := routerproto.NewKeyRangeServiceClient(cc)
-		moveResp, err := cl.MoveKeyRange(ctx, &routerproto.MoveKeyRangeRequest{
-			Id:        krmv.ID,
-			ToShardId: krmv.ShardID,
-		})
-		spqrlog.Zero.Debug().
-			Interface("response", moveResp).
-			Msg("move key range response")
-		return err
-	}); err != nil {
-		return err
+			// update key range
+			krg, err := qc.GetKeyRange(ctx, req.Krid)
+			if err != nil {
+				return err
+			}
+			krg.ShardID = req.ShardId
+			if err := ops.ModifyKeyRangeWithChecks(ctx, qc.db, krg); err != nil {
+				// TODO: check if unlock here is ok
+				return err
+			}
+
+			// Notify all routers about scheme changes.
+			if err := qc.traverseRouters(ctx, func(cc *grpc.ClientConn) error {
+				cl := routerproto.NewKeyRangeServiceClient(cc)
+				moveResp, err := cl.MoveKeyRange(ctx, &routerproto.MoveKeyRangeRequest{
+					Id:        krg.ID,
+					ToShardId: krg.ShardID,
+				})
+				spqrlog.Zero.Debug().
+					Interface("response", moveResp).
+					Msg("move key range response")
+				return err
+			}); err != nil {
+				return err
+			}
+
+			if err := qc.db.UpdateKeyRangeMoveStatus(ctx, move.MoveId, qdb.MoveKeyRangeComplete); err != nil {
+				spqrlog.Zero.Error().Err(err).Msg("")
+			}
+			move.Status = qdb.MoveKeyRangeComplete
+		case qdb.MoveKeyRangeComplete:
+			// unlock key range
+			if err := qc.UnlockKeyRange(ctx, req.Krid); err != nil {
+				spqrlog.Zero.Error().Err(err).Msg("")
+			}
+			if err := qc.db.DeleteKeyRangeMove(ctx, move.MoveId); err != nil {
+				return err
+			}
+			move = nil
+		default:
+			return fmt.Errorf("unknown key range move status: \"%s\"", move.Status)
+		}
 	}
 	return nil
 }
@@ -943,7 +992,7 @@ func (qc *qdbCoordinator) SyncRouterMetadata(ctx context.Context, qRouter *topol
 	}
 
 	for _, keyRange := range keyRanges {
-		resp, err := krClient.AddKeyRange(ctx, &routerproto.AddKeyRangeRequest{
+		resp, err := krClient.CreateKeyRange(ctx, &routerproto.CreateKeyRangeRequest{
 			KeyRangeInfo: kr.KeyRangeFromDB(keyRange).ToProto(),
 		})
 
@@ -958,6 +1007,45 @@ func (qc *qdbCoordinator) SyncRouterMetadata(ctx context.Context, qRouter *topol
 	spqrlog.Zero.Debug().Msg("successfully add all key ranges")
 
 	rCl := routerproto.NewTopologyServiceClient(cc)
+	if _, err := rCl.UpdateCoordinator(ctx, &routerproto.UpdateCoordinatorRequest{
+		Address: net.JoinHostPort(config.CoordinatorConfig().Host, config.CoordinatorConfig().GrpcApiPort),
+	}); err != nil {
+		return err
+	}
+
+	if resp, err := rCl.OpenRouter(ctx, &routerproto.OpenRouterRequest{}); err != nil {
+		return err
+	} else {
+		spqrlog.Zero.Debug().
+			Interface("response", resp).
+			Msg("open router response")
+	}
+
+	return nil
+}
+
+// TODO : unit tests
+func (qc *qdbCoordinator) SyncRouterCoordinatorAddress(ctx context.Context, qRouter *topology.Router) error {
+	spqrlog.Zero.Debug().
+		Str("address", qRouter.Address).
+		Msg("qdb coordinator: sync router metadata")
+
+	cc, err := DialRouter(qRouter)
+	if err != nil {
+		return err
+	}
+	defer cc.Close()
+
+	/* Update current coordinator address. */
+	/* Todo: check that router metadata is in sync. */
+
+	rCl := routerproto.NewTopologyServiceClient(cc)
+	if _, err := rCl.UpdateCoordinator(ctx, &routerproto.UpdateCoordinatorRequest{
+		Address: net.JoinHostPort(config.CoordinatorConfig().Host, config.CoordinatorConfig().GrpcApiPort),
+	}); err != nil {
+		return err
+	}
+
 	if resp, err := rCl.OpenRouter(ctx, &routerproto.OpenRouterRequest{}); err != nil {
 		return err
 	} else {
@@ -1017,10 +1105,14 @@ func (qc *qdbCoordinator) RemoveTaskGroup(ctx context.Context) error {
 }
 
 // TODO : unit tests
-func (qc *qdbCoordinator) PrepareClient(nconn net.Conn) (CoordinatorClient, error) {
-	cl := psqlclient.NewPsqlClient(nconn, port.DefaultRouterPortType, "")
+func (qc *qdbCoordinator) PrepareClient(nconn net.Conn, pt port.RouterPortType) (CoordinatorClient, error) {
+	cl := psqlclient.NewPsqlClient(nconn, pt, "")
 
-	if err := cl.Init(qc.tlsconfig); err != nil {
+	tlsconfig := qc.tlsconfig
+	if pt == port.UnixSocketPortType {
+		tlsconfig = nil
+	}
+	if err := cl.Init(tlsconfig); err != nil {
 		return nil, err
 	}
 
@@ -1060,8 +1152,8 @@ func (qc *qdbCoordinator) PrepareClient(nconn net.Conn) (CoordinatorClient, erro
 }
 
 // TODO : unit tests
-func (qc *qdbCoordinator) ProcClient(ctx context.Context, nconn net.Conn) error {
-	cl, err := qc.PrepareClient(nconn)
+func (qc *qdbCoordinator) ProcClient(ctx context.Context, nconn net.Conn, pt port.RouterPortType) error {
+	cl, err := qc.PrepareClient(nconn, pt)
 	if err != nil {
 		spqrlog.Zero.Error().Err(err).Msg("")
 		return err
