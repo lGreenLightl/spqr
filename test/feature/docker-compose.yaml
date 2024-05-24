@@ -122,6 +122,40 @@ services:
     ports:
       - "2379:2379"
 
+  ldapserver:
+    image: "bitnami/openldap:latest"
+    hostname: regress_ldap_server
+    container_name: regress_ldap_server
+    environment:
+      - LDAP_ROOT=dc=example,dc=com
+      - LDAP_USERS=regress
+      - LDAP_PASSWORDS=password
+      - LDAP_PORT_NUMBER=389
+    ports:
+      - "1389:389"
+    healthcheck:
+      test: ldapwhoami -D "cn=regress,ou=users,dc=example,dc=com" -w password
+      interval: 10s
+      timeout: 3s
+      retries: 50
+  
+  ldapserver2:
+    image: "bitnami/openldap:latest"
+    hostname: regress_ldap_server_2
+    container_name: regress_ldap_server_2
+    environment:
+      - LDAP_ROOT=dc=example,dc=com
+      - LDAP_USERS=regress
+      - LDAP_PASSWORDS=password
+      - LDAP_PORT_NUMBER=389
+    ports:
+      - "2389:389"
+    healthcheck:
+      test: ldapwhoami -D "cn=regress,ou=users,dc=example,dc=com" -w password
+      interval: 10s
+      timeout: 3s
+      retries: 50
+
 #networks:
 #  mysync_net:
 #    driver: bridge

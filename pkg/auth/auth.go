@@ -285,27 +285,20 @@ func AuthFrontend(cl client.Client, rule *config.FrontendRule) error {
 		err = cl.Send(&pgproto3.AuthenticationSASLFinal{Data: []byte(finalMsg)})
 		return err
 	case config.AuthLDAP:
-		conn, activeServer, err := rule.AuthRule.LDAPConfig.ServerConn()
+		conn, err := rule.AuthRule.LDAPConfig.ServerConn()
 		if err != nil {
 			return err
 		}
 		defer conn.Close()
 
-		if rule.AuthRule.LDAPConfig.TLS {
-			err = rule.AuthRule.LDAPConfig.StartTLS(conn, activeServer)
-			if err != nil {
-				return err
-			}
-		}
-
-		switch rule.AuthRule.LDAPConfig.Mode {
+		switch rule.AuthRule.LDAPConfig.AuthMode {
 		case config.SimpleBindMode:
 			password, err := cl.PasswordCT()
 			if err != nil {
 				return err
 			}
 
-			err = rule.AuthRule.LDAPConfig.Bind(conn, cl.Usr(), password)
+			err = rule.AuthRule.LDAPConfig.SimpleBind(conn, cl.Usr(), password)
 			if err != nil {
 				return err
 			}
@@ -336,14 +329,14 @@ func AuthFrontend(cl client.Client, rule *config.FrontendRule) error {
 				return err
 			}
 
-			err = rule.AuthRule.LDAPConfig.Bind(conn, userDN, password)
+			err = rule.AuthRule.LDAPConfig.SimpleBind(conn, userDN, password)
 			if err != nil {
 				return err
 			}
 
 			return nil
 		default:
-			return fmt.Errorf("invalid ldap auth mode '%v'", rule.AuthRule.LDAPConfig.Mode)
+			return fmt.Errorf("invalid ldap auth mode '%v'", rule.AuthRule.LDAPConfig.AuthMode)
 		}
 	default:
 		return fmt.Errorf("invalid auth method '%v'", rule.AuthRule.Method)

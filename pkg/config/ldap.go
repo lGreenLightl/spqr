@@ -12,10 +12,19 @@ import (
 )
 
 type LDAPAuthMode string
+type LDAPConnMode string
+type LDAPTLSVerifyMode string
 
 const (
 	SimpleBindMode    = LDAPAuthMode("simple_bind")
 	SearchAndBindMode = LDAPAuthMode("search_and_bind")
+
+	UnencryptedMode = LDAPConnMode("unencrypted")
+	SchemeMode      = LDAPConnMode("scheme")
+	StartTLSMode    = LDAPConnMode("start_tls")
+
+	OneWayMode = LDAPTLSVerifyMode("one_way")
+	TwoWayMode = LDAPTLSVerifyMode("two_way")
 )
 
 var (
@@ -24,13 +33,9 @@ var (
 )
 
 type LDAPConfig struct {
-	Mode LDAPAuthMode `json:"ldap_auth_mode" yaml:"ldap_auth_mode" toml:"ldap_auth_mode"`
-
-	Scheme       string   `json:"scheme" yaml:"scheme" toml:"scheme"`
-	TLS          bool     `json:"tls" yaml:"tls" toml:"tls"`
-	RootCertFile string   `json:"root_cert_file" yaml:"root_cert_file" toml:"root_cert_file"`
-	Servers      []string `json:"servers" yaml:"servers" toml:"servers"`
-	Port         string   `json:"port" yaml:"port" toml:"port"`
+	AuthMode   LDAPAuthMode    `json:"ldap_auth_mode" yaml:"ldap_auth_mode" toml:"ldap_auth_mode"`
+	ConnConfig *LDAPConnConfig `json:"ldap_conn_config" yaml:"ldap_conn_config" toml:"ldap_conn_config"`
+	Servers    []string        `json:"servers" yaml:"servers" toml:"servers"`
 
 	Prefix string `json:"prefix" yaml:"prefix" toml:"prefix"`
 	Suffix string `json:"suffix" yaml:"suffix" toml:"suffix"`
@@ -42,40 +47,46 @@ type LDAPConfig struct {
 	SearchFilter    string `json:"search_filter" yaml:"search_filter" toml:"search_filter"`
 }
 
-func (l *LDAPConfig) ServerConn() (*ldap.Conn, string, error) {
-	for _, server := range l.Servers {
-		conn, err := ldap.DialURL(l.ldapUrl(server))
-		if err != nil {
-			continue
+type LDAPConnConfig struct {
+	ConnMode  LDAPConnMode   `json:"ldap_conn_mode" yaml:"ldap_conn_mode" toml:"ldap_conn_mode"`
+	Scheme    string         `json:"scheme" yaml:"scheme" toml:"scheme"`
+	Port      string         `json:"port" yaml:"port" toml:"port"`
+	TLSConfig *LDAPTLSConfig `json:"ldap_tls_config" yaml:"ldap_tls_config" toml:"ldap_tls_config"`
+}
+
+type LDAPTLSConfig struct {
+	TLSVerifyMode LDAPTLSVerifyMode `json:"tls_verify_mode" yaml:"tls_verify_mode" toml:"tls_verify_mode"`
+	RootCertFile  string            `json:"root_cert_file" toml:"root_cert_file" yaml:"root_cert_file"`
+	CertFile      string            `json:"cert_file" toml:"cert_file" yaml:"cert_file"`
+	KeyFile       string            `json:"key_file" toml:"key_file" yaml:"key_file"`
+}
+
+func (l *LDAPConfig) ServerConn() (*ldap.Conn, error) {
+	switch l.ConnConfig.ConnMode {
+	case UnencryptedMode, SchemeMode, StartTLSMode:
+		for _, server := range l.Servers {
+			conn, err := ldap.DialURL(l.ldapUrl(server))
+			if err != nil {
+				continue
+			}
+
+			if l.ConnConfig.ConnMode == StartTLSMode {
+				err = l.startTLS(conn, server)
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			return conn, nil
 		}
 
-		return conn, server, nil
+		return nil, ErrServerConn
+	default:
+		return nil, fmt.Errorf("invalid ldap connection mode '%v'", l.ConnConfig.ConnMode)
 	}
-
-	return nil, "", ErrServerConn
 }
 
-func (l *LDAPConfig) StartTLS(conn *ldap.Conn, server string) error {
-	caCert, err := os.ReadFile(l.RootCertFile)
-	if err != nil {
-		return err
-	}
-
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
-
-	err = conn.StartTLS(&tls.Config{
-		ServerName: server,
-		RootCAs:    caCertPool,
-	})
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (l *LDAPConfig) Bind(conn *ldap.Conn, username string, password string) error {
+func (l *LDAPConfig) SimpleBind(conn *ldap.Conn, username string, password string) error {
 	err := conn.Bind(l.ldapUsername(username), password)
 	if err != nil {
 		return err
@@ -90,7 +101,7 @@ func (l *LDAPConfig) SearchBind(conn *ldap.Conn) error {
 	if l.BindDN == "" || l.BindPassword == "" {
 		err = conn.UnauthenticatedBind("")
 	} else {
-		err = l.Bind(conn, l.BindDN, l.BindPassword)
+		err = l.SimpleBind(conn, l.BindDN, l.BindPassword)
 	}
 	if err != nil {
 		return err
@@ -146,8 +157,63 @@ func (l *LDAPConfig) CheckSearchResult(entries []*ldap.Entry) error {
 	return nil
 }
 
+func (l *LDAPConfig) startTLS(conn *ldap.Conn, server string) error {
+	switch l.ConnConfig.TLSConfig.TLSVerifyMode {
+	case OneWayMode:
+		caCertPool, err := l.loadCaCertPool()
+		if err != nil {
+			return err
+		}
+
+		err = conn.StartTLS(&tls.Config{
+			ServerName: server,
+			RootCAs:    caCertPool,
+		})
+		if err != nil {
+			return err
+		}
+
+		return nil
+	case TwoWayMode:
+		cert, err := tls.LoadX509KeyPair(l.ConnConfig.TLSConfig.CertFile, l.ConnConfig.TLSConfig.KeyFile)
+		if err != nil {
+			return err
+		}
+
+		caCertPool, err := l.loadCaCertPool()
+		if err != nil {
+			return err
+		}
+
+		err = conn.StartTLS(&tls.Config{
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      caCertPool,
+			ServerName:   server,
+		})
+		if err != nil {
+			return err
+		}
+
+		return nil
+	default:
+		return fmt.Errorf("invlaid ldap tls mode '%v'", l.ConnConfig.TLSConfig.TLSVerifyMode)
+	}
+}
+
+func (l *LDAPConfig) loadCaCertPool() (*x509.CertPool, error) {
+	caCert, err := os.ReadFile(l.ConnConfig.TLSConfig.RootCertFile)
+	if err != nil {
+		return nil, err
+	}
+
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	return caCertPool, nil
+}
+
 func (l *LDAPConfig) ldapUrl(server string) string {
-	return fmt.Sprintf("%s://%s:%s", l.Scheme, server, l.Port)
+	return fmt.Sprintf("%s://%s:%s", l.ConnConfig.Scheme, server, l.ConnConfig.Port)
 }
 
 func (l *LDAPConfig) ldapUsername(username string) string {
